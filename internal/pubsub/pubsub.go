@@ -1,75 +1,111 @@
 package pubsub
 
 import (
-	amqp "github.com/rabbitmq/amqp091-go"
 	"encoding/json"
+	"fmt"
 	"context"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
-	b, err := json.Marshal(val)
+type SimpleQueueType int
+
+const (
+	SimpleQueueDurable SimpleQueueType = iota
+	SimpleQueueTransient
+)
+
+func SubscribeJSON[T any](
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType SimpleQueueType,
+	handler func(T),
+) error {
+	ch, queue, err := DeclareAndBind(conn, exchange, queueName, key, queueType)
 	if err != nil {
-		return err
+		return fmt.Errorf("could not declare and bind queue: %v", err)
 	}
-	err = ch.PublishWithContext(context.Background(), exchange, key, false, false, amqp.Publishing{
-		ContentType: "application/json",
-		Body: b,
-	})
-	if err != nil{
-		return err
+
+	msgs, err := ch.Consume(
+		queue.Name, // queue
+		"",         // consumer
+		false,      // auto-ack
+		false,      // exclusive
+		false,      // no-local
+		false,      // no-wait
+		nil,        // args
+	)
+	if err != nil {
+		return fmt.Errorf("could not consume messages: %v", err)
 	}
+
+	unmarshaller := func(data []byte) (T, error) {
+		var target T
+		err := json.Unmarshal(data, &target)
+		return target, err
+	}
+
+	go func() {
+		defer ch.Close()
+		for msg := range msgs {
+			target, err := unmarshaller(msg.Body)
+			if err != nil {
+				fmt.Printf("could not unmarshal message: %v\n", err)
+				continue
+			}
+			handler(target)
+			msg.Ack(false)
+		}
+	}()
 	return nil
 }
 
-type SimpleQueueType string
-
-const (
-    QueueTransient SimpleQueueType = "transient"
-    QueueDurable   SimpleQueueType = "durable"
-)
-
-func DeclareAndBind(conn *amqp.Connection, exchange, queueName, key string, queueType SimpleQueueType) (*amqp.Channel, amqp.Queue, error) {
-	ch, err:= conn.Channel()
+func DeclareAndBind(
+	conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType SimpleQueueType,
+) (*amqp.Channel, amqp.Queue, error) {
+	ch, err := conn.Channel()
 	if err != nil {
-		return nil, amqp.Queue{}, err
+		return nil, amqp.Queue{}, fmt.Errorf("could not create channel: %v", err)
 	}
 
-	var durable, autoDelete, exclusive bool
-
-	switch queueType {
-	case QueueDurable:
-  	durable = true
-    autoDelete = false
-    exclusive = false
-	case QueueTransient:
-    durable = false
-    autoDelete = true
-    exclusive = true
-	}
-
-	q, err := ch.QueueDeclare(
-		queueName,
-		durable,
-		autoDelete,
-		exclusive,
-		false,
-		nil,
+	queue, err := ch.QueueDeclare(
+		queueName,                       // name
+		queueType == SimpleQueueDurable, // durable
+		queueType != SimpleQueueDurable, // delete when unused
+		queueType != SimpleQueueDurable, // exclusive
+		false,                           // no-wait
+		nil,                             // args
 	)
 	if err != nil {
-		ch.Close()
-		return nil, amqp.Queue{}, err
+		return nil, amqp.Queue{}, fmt.Errorf("could not declare queue: %v", err)
 	}
 
 	err = ch.QueueBind(
-		q.Name,
-		key,
-		exchange,
-		false,
-		nil,
+		queue.Name, // queue name
+		key,        // routing key
+		exchange,   // exchange
+		false,      // no-wait
+		nil,        // args
 	)
 	if err != nil {
-		ch.Close()
-		return nil, amqp.Queue{}, err
+		return nil, amqp.Queue{}, fmt.Errorf("could not bind queue: %v", err)
 	}
-	return ch, q, nil
+	return ch, queue, nil
+}
+
+func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
+	dat, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	return ch.PublishWithContext(context.Background(), exchange, key, false, false, amqp.Publishing{
+		ContentType: "application/json",
+		Body:        dat,
+	})
 }

@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"log"
 
-	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/pubsub"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/routing"
-	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func main() {
@@ -19,26 +19,26 @@ func main() {
 	}
 	defer conn.Close()
 	fmt.Println("Peril game server connected to RabbitMQ!")
-	
-	key := fmt.Sprintf("%s.*", routing.GameLogSlug)
-	_, _, err = pubsub.DeclareAndBind(
+
+	publishCh, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("could not create channel: %v", err)
+	}
+
+	err = pubsub.SubscribeGob(
 		conn,
 		routing.ExchangePerilTopic,
 		routing.GameLogSlug,
-		key,
-		pubsub.QueueDurable,
+		routing.GameLogSlug+".*",
+		pubsub.SimpleQueueDurable,
+		handlerLogs(),
 	)
 	if err != nil {
-		log.Printf("Could not make durable queue: %v", err)
+		log.Fatalf("could not starting consuming logs: %v", err)
 	}
 
 	gamelogic.PrintServerHelp()
 
-	publishCh, err := conn.Channel()
-	if err != nil {
-		log.Printf("could not create channel: %v", err)
-	}
-	
 	for {
 		words := gamelogic.GetInput()
 		if len(words) == 0 {
@@ -79,3 +79,18 @@ func main() {
 		}
 	}
 }
+
+func handlerLogs() func(gamelog routing.GameLog) pubsub.Acktype {
+	return func(gamelog routing.GameLog) pubsub.Acktype {
+		defer fmt.Print("> ")
+
+		err := gamelogic.WriteLog(gamelog)
+		if err != nil {
+			fmt.Printf("error writing log: %v\n", err)
+			return pubsub.NackRequeue
+		}
+		return pubsub.Ack
+	}
+}
+
+
